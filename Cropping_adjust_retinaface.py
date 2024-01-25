@@ -654,8 +654,7 @@ if __name__ == '__main__':
 
                     # DataFrame에 정보 추가
                     # df = df.append({"PATH": ID_video, "BOX": adjusted_box}, ignore_index=True)
-                    df = pd.concat([df, pd.DataFrame({"PATH": [ID_video], "BOX": [adjusted_box]})], ignore_index=True)
-
+                    df = pd.concat([df, pd.DataFrame({"PATH": [ID_video], "FrameNum":[i], "BOX": [adjusted_box]})], ignore_index=True)
                     i += 1
                     framenum.append(i)
 
