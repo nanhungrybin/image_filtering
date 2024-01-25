@@ -623,11 +623,7 @@ if __name__ == '__main__':
                     now_frame += 1
 
 
-        
-
-                        
-
-                    cropped_padding = np.zeros((int(adjust_height) , int(adjust_width), 3), dtype=np.uint8)
+      
 
             
                     # cv2.rectangle(frame, (adjusted_box[0], adjusted_box[1]), (adjusted_box[2], adjusted_box[3]), (0, 0, 255), 2)
@@ -637,11 +633,11 @@ if __name__ == '__main__':
 
 
                     # cropped_face 을  cropped_padding에 삽입
+
+
+                    cropped_padding = np.zeros_like(cropped_face, dtype=np.uint8)
                     cropped_padding[:cropped_face.shape[0], :cropped_face.shape[1], : ] = cropped_face
 
-
-                    cropped_padding[cropped_face.shape[0]:, :, :] = 0
-                    cropped_padding[:, cropped_face.shape[1]: , :] = 0
 
             
 
