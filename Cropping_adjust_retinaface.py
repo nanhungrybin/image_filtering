@@ -386,6 +386,12 @@ if __name__ == '__main__':
                 dets = np.concatenate((dets, landms), axis=1)
 
 
+                # Check if any face is detected
+                if len(dets) == 0:
+                    print("No face detected. Skipping to the next frame...")
+                    continue  # Skip to the next frame if no face is detected
+
+
 
 
                 
