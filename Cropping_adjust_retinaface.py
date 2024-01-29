@@ -15,7 +15,7 @@ import pandas as pd
 
 parser = argparse.ArgumentParser(description='Retinaface')
 
-parser.add_argument('-m', '--trained_model', default='/workspace/Pytorch_Retinaface/weights/Resnet50_Final.pth',
+parser.add_argument('-m', '--trained_model', default='C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\weights\\Resnet50_Final.pth',
                     type=str, help='Trained state_dict file path to open')
 parser.add_argument('--network', default='resnet50', help='Backbone network mobile0.25 or resnet50')
 parser.add_argument('--cpu', action="store_true", default=False, help='Use cpu inference')
@@ -286,7 +286,7 @@ if __name__ == '__main__':
 # 근데 똑같이 왼쪽 위를 쳐다보고 있는 48번 프레임에서 바운딩 박스의 좌표는 (714, 105, 1148, 640) 눈의 좌표는 (823, 279, 1013, 305), 코의 좌표는 (884, 355) 입의 좌표는 (805, 479, 953, 502)인데 이때는 턱이 잘려서 바운딩 박스가 비정상적 이야
 
 
-    data_path = "/workspace/aff_wild2/"
+    data_path = "C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\aff_wild2\\"
 
     # DataFrame 초기화
     df = pd.DataFrame(columns=["PATH", "BOX"])
@@ -299,6 +299,17 @@ if __name__ == '__main__':
         videopaths = [os.path.join(batchfolderpath, video) for video in videos]
 
         for ID_video in videopaths:
+
+            # 파일명에서 확장자 제거
+            ID_video_name = os.path.splitext(os.path.basename(ID_video))[0]
+
+            # 이미 처리된 동영상인지 확인
+            csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
+            save_folder = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\Cropped_affwild2\\{ID_video_name}\\'
+
+            if os.path.exists(csv_save_path) and os.path.exists(save_folder):
+                print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
+                continue  # 이미 처리된 동영상이면 다음 동영상으로 넘어감
 
 
             cap = cv2.VideoCapture(ID_video)
@@ -318,6 +329,7 @@ if __name__ == '__main__':
             now_frame = 0
             all_frame = []
             prev_box = None
+            adjusted_box = None  # 전역 변수로 설정
 
             while cap.isOpened():
 
@@ -328,15 +340,11 @@ if __name__ == '__main__':
                     break
 
 
-              # 이미지가 비어 있는지 또는 크기가 없는지 확인
-              if img is None or img.size == 0:
-                  print("오류: 이미지가 비어 있거나 크기가 없습니다. 다음 프레임으로 넘어갑니다.")
-                  continue
-
-             
-
-
                 img = np.float32(frame)
+
+                if img is None or img.size == 0:
+                    print("오류: 이미지가 비어 있거나 크기가 없습니다. 다음 프레임으로 넘어갑니다.")
+                    continue
 
                 im_height, im_width, _ = img.shape
                 scale = torch.Tensor([img.shape[1], img.shape[0], img.shape[1], img.shape[0]])
@@ -394,15 +402,13 @@ if __name__ == '__main__':
                 dets = np.concatenate((dets, landms), axis=1)
 
 
-                # Check if any face is detected
-                if len(dets) == 0:
-                    print("No face detected. Skipping to the next frame...")
-                    continue  # Skip to the next frame if no face is detected
+                # 얼굴이 잡히지 않으면 다음프레임으로
+                if len(dets)==0:
+                    continue
 
 
+                # 프레임에서 얼굴이 검출되지 않아 adjusted_box가 None으로 설정되는 경우 :  아래에서 처리
 
-
-                
 
                 # show image
                 if args.save_image:
@@ -636,44 +642,44 @@ if __name__ == '__main__':
                     prev_box = adjusted_box
                     now_frame += 1
 
+                    if adjusted_box is not None:
 
-      
-
-            
-                    # cv2.rectangle(frame, (adjusted_box[0], adjusted_box[1]), (adjusted_box[2], adjusted_box[3]), (0, 0, 255), 2)
-
-                    # 이미지를 크롭할 부분 추출
-                    cropped_face = frame[adjusted_box[1]:adjusted_box[3], adjusted_box[0]:adjusted_box[2]]
+                        # 이미지를 크롭할 부분 추출
+                        cropped_face = frame[adjusted_box[1]:adjusted_box[3], adjusted_box[0]:adjusted_box[2]]
 
 
-                    # cropped_face 을  cropped_padding에 삽입
+                        cropped_padding = np.zeros_like(cropped_face, dtype=np.uint8)
+                        cropped_padding[:cropped_face.shape[0], :cropped_face.shape[1], : ] = cropped_face
 
 
-                    cropped_padding = np.zeros_like(cropped_face, dtype=np.uint8)
-                    cropped_padding[:cropped_face.shape[0], :cropped_face.shape[1], : ] = cropped_face
-
-
-            
+                
 
 
 
-                    # 파일명에서 확장자 제거
-                    ID_video_name = os.path.splitext(os.path.basename(ID_video))[0]
+                        # 파일명에서 확장자 제거
+                        ID_video_name = os.path.splitext(os.path.basename(ID_video))[0]
 
-                    # 폴더가 없으면 생성
-                    save_folder = f'/workspace/Pytorch_Retinaface/Cropped_affwild2/{ID_video_name}/'
-                    os.makedirs(save_folder, exist_ok=True)
-                    csv_save_path = f'/workspace/Pytorch_Retinaface/CSV_cropped_affwild2/{ID_video_name}.csv'
+                        # 폴더가 없으면 생성
+                        save_folder = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\Cropped_affwild2\\{ID_video_name}\\'
+                        os.makedirs(save_folder, exist_ok=True)
 
-                    if os.path.exists(csv_save_path) and os.path.exists(save_folder):
-                      print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
-                      continue  # 이미 처리된 동영상이면 다음 동영상으로 넘어감
+                        # 이미 처리된 동영상인지 확인후 스킵
+                        csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
 
-                    cv2.imwrite(f'{save_folder}{i}.jpg', cv2.resize(cropped_padding, (224, 224)))
+                        if os.path.exists(csv_save_path) and os.path.exists(save_folder):
+                            print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
+                            continue
 
-                    # DataFrame에 정보 추가
-                    # df = df.append({"PATH": ID_video, "BOX": adjusted_box}, ignore_index=True)
-                    df = pd.concat([df, pd.DataFrame({"PATH": [ID_video], "FrameNum":[i], "BOX": [adjusted_box]})], ignore_index=True)
+                        cv2.imwrite(f'{save_folder}{i}.jpg', cv2.resize(cropped_padding, (224, 224)))
+
+                        # DataFrame에 정보 추가
+                        # df = df.append({"PATH": ID_video, "BOX": adjusted_box}, ignore_index=True)
+                        df = pd.concat([df, pd.DataFrame({"PATH": [ID_video], "FrameNum": [i], "BOX": [adjusted_box]})], ignore_index=True)
+                    else :
+                        print("얼굴이 검출되지 않았습니다.")
+                        continue  # 얼굴이 검출되지 않았을 때 다음 프레임으로 넘어가기
+
+
                     i += 1
                     framenum.append(i)
 
@@ -687,14 +693,9 @@ if __name__ == '__main__':
 
             print(f" #################################{ID_video_name} done")
             # CSV 파일로 저장
-            csv_save_path = f'/workspace/Pytorch_Retinaface/CSV_cropped_affwild2/{ID_video_name}.csv'
+            csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
             df.to_csv(csv_save_path, index=False)
 
             
                     
         cap.release()
-
-
-                        
-
-
