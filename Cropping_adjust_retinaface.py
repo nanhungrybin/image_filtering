@@ -324,8 +324,16 @@ if __name__ == '__main__':
                 ret, frame = cap.read()
 
                 if not ret:
-                    print("프레임을 읽는 데 실패했습니다. 종료 중...")
+                    print("프레임을 읽는 데 실패했습니다. 종료 중...") # 프레임을 읽는 데 실패했을 때 종료하는 것이지만, 이는 이미지가 비어 있거나 크기가 없는 경우까지는 다루지 않음
                     break
+
+
+              # 이미지가 비어 있는지 또는 크기가 없는지 확인
+              if img is None or img.size == 0:
+                  print("오류: 이미지가 비어 있거나 크기가 없습니다. 다음 프레임으로 넘어갑니다.")
+                  continue
+
+             
 
 
                 img = np.float32(frame)
@@ -655,6 +663,11 @@ if __name__ == '__main__':
                     # 폴더가 없으면 생성
                     save_folder = f'/workspace/Pytorch_Retinaface/Cropped_affwild2/{ID_video_name}/'
                     os.makedirs(save_folder, exist_ok=True)
+                    csv_save_path = f'/workspace/Pytorch_Retinaface/CSV_cropped_affwild2/{ID_video_name}.csv'
+
+                    if os.path.exists(csv_save_path) and os.path.exists(save_folder):
+                      print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
+                      continue  # 이미 처리된 동영상이면 다음 동영상으로 넘어감
 
                     cv2.imwrite(f'{save_folder}{i}.jpg', cv2.resize(cropped_padding, (224, 224)))
 
