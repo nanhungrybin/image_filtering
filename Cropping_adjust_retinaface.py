@@ -4,18 +4,19 @@ import argparse
 import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
-from data import cfg_mnet, cfg_re50
-from layers.functions.prior_box import PriorBox
-from utils.nms.py_cpu_nms import py_cpu_nms
+from Pytorch_Retinaface.data import cfg_mnet, cfg_re50
+from Pytorch_Retinaface.layers.functions.prior_box import PriorBox
+from Pytorch_Retinaface.utils.nms.py_cpu_nms import py_cpu_nms
 import cv2
-from models.retinaface import RetinaFace
-from utils.box_utils import decode, decode_landm
+from Pytorch_Retinaface.models.retinaface import RetinaFace
+from Pytorch_Retinaface.utils.box_utils import decode, decode_landm
 import time
 import pandas as pd
 
+
 parser = argparse.ArgumentParser(description='Retinaface')
 
-parser.add_argument('-m', '--trained_model', default='C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\weights\\Resnet50_Final.pth',
+parser.add_argument('-m', '--trained_model', default='Pytorch_Retinaface\\weights\\Resnet50_Final.pth',
                     type=str, help='Trained state_dict file path to open')
 parser.add_argument('--network', default='resnet50', help='Backbone network mobile0.25 or resnet50')
 parser.add_argument('--cpu', action="store_true", default=False, help='Use cpu inference')
@@ -66,227 +67,73 @@ def load_model(model, pretrained_path, load_to_cpu):
     return model
 
 
-if __name__ == '__main__':
+def detect_face(frame): 
 
+    img = np.float32(frame)
 
-    torch.set_grad_enabled(False)
-    cfg = None
-    if args.network == "mobile0.25":
-        cfg = cfg_mnet
-    elif args.network == "resnet50":
-        cfg = cfg_re50
-    # net and model
-    net = RetinaFace(cfg=cfg, phase = 'test')
-    net = load_model(net, args.trained_model, args.cpu)
-    net.eval()
-    print('Finished loading model!')
-    print(net)
-    cudnn.benchmark = True
-    device = torch.device("cpu" if args.cpu else "cuda")
-    net = net.to(device)
+    if img is None or img.size == 0:
+        print("오류: 이미지가 비어 있거나 크기가 없습니다. 다음 프레임으로 넘어갑니다.")
+        return None
 
-    resize = 1
+    im_height, im_width, _ = img.shape
+    scale = torch.Tensor([img.shape[1], img.shape[0], img.shape[1], img.shape[0]])
+    img -= (104, 117, 123)
+    img = img.transpose(2, 0, 1)
+    img = torch.from_numpy(img).unsqueeze(0)
+    img = img.to(device)
+    scale = scale.to(device)
 
-    # testing begin
+    tic = time.time()
+    loc, conf, landms = net(img)  # forward pass
+    print('net forward time: {:.4f}'.format(time.time() - tic))
 
+    priorbox = PriorBox(cfg, image_size=(im_height, im_width))
+    priors = priorbox.forward()
+    priors = priors.to(device)
+    prior_data = priors.data
 
-    #####################################
-    def adjust_box_around_nose(box, eye, nose, mouth):
+    boxes = decode(loc.data.squeeze(0), prior_data, cfg['variance'])
+    boxes = boxes * scale / resize
+    boxes = boxes.cpu().numpy()
     
-        width = box[2] - box[0] # 박스의 가로
-        height = box[3] - box[1] # 박스 세로
+    scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
+    landms = decode_landm(landms.data.squeeze(0), prior_data, cfg['variance'])
+    scale1 = torch.Tensor([img.shape[3], img.shape[2], img.shape[3], img.shape[2],
+                        img.shape[3], img.shape[2], img.shape[3], img.shape[2],
+                        img.shape[3], img.shape[2]])
+    scale1 = scale1.to(device)
+    landms = landms * scale1 / resize
+    landms = landms.cpu().numpy()
 
-       
-        # 새로운 박스의 중심점 => (코와 눈의 위치로 조절)
-        center_eye_x = ( eye[0] + eye[2] )/2
-        center_nose_x = nose[0]
-        center_mouth_x = ( mouth[0] + mouth[2] )/2
-        # y좌표는 고정
-        center_nose_y = nose[1]
-        center_eye_y = ( eye[1] + eye[3] )/2
-        center_mouth_y = ( mouth[1] + mouth[3] )/2
+    # ignore low scores
+    inds = np.where(scores > args.confidence_threshold)[0]
+    boxes = boxes[inds]
+    landms = landms[inds]
+    scores = scores[inds]
 
+    # keep top-K before NMS
+    order = scores.argsort()[::-1][:args.top_k]
+    boxes = boxes[order]
+    landms = landms[order]
+    scores = scores[order]
 
+    # do NMS
+    dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+    keep = py_cpu_nms(dets, args.nms_threshold)
+    # keep = nms(dets, args.nms_threshold,force_cpu=args.cpu)
+    dets = dets[keep, :]
+    landms = landms[keep]
 
-        # 왼쪽을 바라볼때 ################################################################################################
-        if (center_eye_x > center_nose_x) and (center_mouth_x > center_nose_x):
+    # keep top-K faster NMS
+    dets = dets[:args.keep_top_k, :]
+    landms = landms[:args.keep_top_k, :]
 
-            ########################################## 정면인데 이상하게 나오는거 추가 ####################################################3
-            if (( mouth[0] + mouth[2] )/3 <  center_nose_x) and (mouth[0]-eye[0] >= 10 ) :
-                    
-                # 정면을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
-                if abs(center_eye_y - center_nose_y)  <=  abs(center_mouth_y - center_nose_y)*0.35  :
-                    # 새로운 박스의 x1, y1
-                    new_x1 = int(center_eye_x - ( width / 2))
-                    new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2))
+    dets = np.concatenate((dets, landms), axis=1)
 
-
-                # 정면을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #####################################
-                elif abs(center_eye_y - center_nose_y)*0.5  >= abs(center_mouth_y - center_nose_y) :
-
-                    # 새로운 박스의 x1, y1
-                    new_x1 = int(center_eye_x - ( width / 2))
-                    #new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))
-                    #new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2)) # 박스를 위로 올리기
-                    new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 위로 올리기
-
-                    
-                
-
-                # 완전 정면 ###############################################################################################
-                else :
-                    # 새로운 박스의 x1, y1
-                    new_x1 = int(center_eye_x - ( width / 2))
-                    new_y1 = int(center_nose_y - (height / 2))
+    return dets, im_height, im_width
 
 
-            # 왼쪽을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
-            elif abs(center_mouth_y - center_nose_y)*0.29 <= abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.45 :
-
-                new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2))    ##### y 좌표가 아래로 내려가야 함
-
-                # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
-                    
-                else :
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
-
-
-            # 왼쪽을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #########################################
-            elif abs(center_eye_y - center_nose_y)*0.5 >= abs(center_mouth_y - center_nose_y) : 
-
-                new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))     ##### y 좌표가 위로 올라가야 함
-
-                # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
-                    
-
-                else :
-
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
-
-            
-      
-            else : # 왼쪽을 바라보는데 정면 ##################################################################################
-                
-                new_y1 = int(center_nose_y - (height / 2))
-
-                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
-                    
-                else :
-
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
-
-
-        # 오른쪽을 바라볼때 ###################################################################################################
-        elif (center_eye_x < center_nose_x) and (center_mouth_x < center_nose_x) :
-
-            # 오른쪽을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ############################################
-            # if abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.47  :
-            # if abs(center_eye_y - center_nose_y) >= abs(center_mouth_y - center_nose_y) * 0.45:
-            if abs(center_mouth_y - center_nose_y)*0.29 <= abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.45 :
-
-                new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2))   ##### y 좌표가 아래로 내려가야 함
-
-                # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
-
-                else :
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
-
-
-            # 오른쪽을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 ############################################
-            elif abs(center_eye_y - center_nose_y)* 0.75 >= abs(center_mouth_y - center_nose_y) :
-            #elif abs(center_eye_y - center_nose_y) >= abs(center_mouth_y - center_nose_y) * 0.45:
-
-                new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2))    ##### y 좌표가 위로 올라가야 함
-
-                # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    # new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
-                    new_x1 = int(center_eye_x - (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
-                    
-                else :
-
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    # new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
-                    new_x1 = int(center_eye_x - (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
-
-
-            else : # 오른쪽을 바라보는데 정면 #############################################################################
-
-                new_y1 = int(center_nose_y - (height / 2))
-
-                # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
-                if center_eye_x > center_mouth_x :
-
-                    #new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
-                    new_x1 = int(center_eye_x - (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
-                    
-
-                else :
-                    # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
-                    #new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
-                    new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
-
-
-        # 정면을 바라볼때 #############################################################################################
-        else:
-
-            # 정면을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
-            if abs(center_eye_y - center_nose_y)  <=  abs(center_mouth_y - center_nose_y)*0.35  :
-                # 새로운 박스의 x1, y1
-                new_x1 = int(center_eye_x - ( width / 2))
-                new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 내리기
-
-
-            # 정면을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #####################################
-            elif abs(center_eye_y - center_nose_y)*0.5  >= abs(center_mouth_y - center_nose_y) :
-
-                # 새로운 박스의 x1, y1
-                new_x1 = int(center_eye_x - ( width / 2))
-                #new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))
-                #new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2)) # 박스를 위로 올리기
-                new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 위로 올리기
-
-                
-               
-
-            # 완전 정면 ###############################################################################################
-            else :
-                # 새로운 박스의 x1, y1
-                new_x1 = int(center_eye_x - ( width / 2))
-                new_y1 = int(center_nose_y - (height / 2))
-
-
-
-        # 새로운 박스의 x2, y2
-        new_x2 = new_x1 + width
-        new_y2 = new_y1 + height
-
-        return new_x1, new_y1, new_x2, new_y2 # 코의 위치로 조절한 새로운 박스
-    
-    #######################################
-
-# 왼쪽 위를 쳐다보고 있는 47번 프레임에서 바운딩 박스의 좌표는 (713, 121, 1139, 653) 눈의 좌표는 (811, 292, 1003, 313), 코의 좌표는 (872, 357) 입의 좌표는 (798, 490, 947, 509) 라고 할때 프레임의 바운딩 박스가 정상적
-# 근데 똑같이 왼쪽 위를 쳐다보고 있는 48번 프레임에서 바운딩 박스의 좌표는 (714, 105, 1148, 640) 눈의 좌표는 (823, 279, 1013, 305), 코의 좌표는 (884, 355) 입의 좌표는 (805, 479, 953, 502)인데 이때는 턱이 잘려서 바운딩 박스가 비정상적 이야
-
-
-    data_path = "C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\aff_wild2\\"
+def main(img_db_path, csv_db_path): 
 
     # DataFrame 초기화
     df = pd.DataFrame(columns=["PATH", "BOX"])
@@ -304,8 +151,9 @@ if __name__ == '__main__':
             ID_video_name = os.path.splitext(os.path.basename(ID_video))[0]
 
             # 이미 처리된 동영상인지 확인
-            csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
-            save_folder = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\Cropped_affwild2\\{ID_video_name}\\'
+            csv_save_path = os.path.join(csv_db_path, f'{ID_video_name}.csv')
+            save_folder = os.path.join(img_db_path, f'{ID_video_name}')
+
 
             if os.path.exists(csv_save_path) and os.path.exists(save_folder):
                 print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
@@ -324,6 +172,7 @@ if __name__ == '__main__':
 
             if not cap.isOpened():
                 print("error video")
+                continue
 
             # 현재프레임
             now_frame = 0
@@ -339,81 +188,20 @@ if __name__ == '__main__':
                     print("프레임을 읽는 데 실패했습니다. 종료 중...") # 프레임을 읽는 데 실패했을 때 종료하는 것이지만, 이는 이미지가 비어 있거나 크기가 없는 경우까지는 다루지 않음
                     break
 
+                # RetinaFace Detection. 
+                dets,_,_ = detect_face(frame)
 
-                img = np.float32(frame)
-
-                if img is None or img.size == 0:
-                    print("오류: 이미지가 비어 있거나 크기가 없습니다. 다음 프레임으로 넘어갑니다.")
-                    continue
-
-                im_height, im_width, _ = img.shape
-                scale = torch.Tensor([img.shape[1], img.shape[0], img.shape[1], img.shape[0]])
-                img -= (104, 117, 123)
-                img = img.transpose(2, 0, 1)
-                img = torch.from_numpy(img).unsqueeze(0)
-                img = img.to(device)
-                scale = scale.to(device)
-
-                tic = time.time()
-                loc, conf, landms = net(img)  # forward pass
-                print('net forward time: {:.4f}'.format(time.time() - tic))
-
-                priorbox = PriorBox(cfg, image_size=(im_height, im_width))
-                priors = priorbox.forward()
-                priors = priors.to(device)
-                prior_data = priors.data
-
-                boxes = decode(loc.data.squeeze(0), prior_data, cfg['variance'])
-                boxes = boxes * scale / resize
-                boxes = boxes.cpu().numpy()
+                _,im_width,im_height = detect_face(frame)
                 
-                scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
-                landms = decode_landm(landms.data.squeeze(0), prior_data, cfg['variance'])
-                scale1 = torch.Tensor([img.shape[3], img.shape[2], img.shape[3], img.shape[2],
-                                    img.shape[3], img.shape[2], img.shape[3], img.shape[2],
-                                    img.shape[3], img.shape[2]])
-                scale1 = scale1.to(device)
-                landms = landms * scale1 / resize
-                landms = landms.cpu().numpy()
-
-                # ignore low scores
-                inds = np.where(scores > args.confidence_threshold)[0]
-                boxes = boxes[inds]
-                landms = landms[inds]
-                scores = scores[inds]
-
-                # keep top-K before NMS
-                order = scores.argsort()[::-1][:args.top_k]
-                boxes = boxes[order]
-                landms = landms[order]
-                scores = scores[order]
-
-                # do NMS
-                dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
-                keep = py_cpu_nms(dets, args.nms_threshold)
-                # keep = nms(dets, args.nms_threshold,force_cpu=args.cpu)
-                dets = dets[keep, :]
-                landms = landms[keep]
-
-                # keep top-K faster NMS
-                dets = dets[:args.keep_top_k, :]
-                landms = landms[:args.keep_top_k, :]
-
-                dets = np.concatenate((dets, landms), axis=1)
-
-
                 # 얼굴이 잡히지 않으면 다음프레임으로
                 if len(dets)==0:
+                    i += 1
                     continue
-
 
                 # 프레임에서 얼굴이 검출되지 않아 adjusted_box가 None으로 설정되는 경우 :  아래에서 처리
 
-
                 # show image
                 if args.save_image:
-
-                    
 
                     for b in dets:
                         if b[4] < args.vis_thres:
@@ -441,21 +229,16 @@ if __name__ == '__main__':
                         mouth_y1 = b[12]
                         mouth_y2 = b[14]
 
-
-
-
                         # 박스의 가로와 세로
-
                         width = b[2] - b[0]
                         height = b[3] - b[1]
 
                         # 만들어진 박스의 중심이 코일 수 있도록 조정 하기
-                        adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
-
+                        adjusted_box = (b[0], b[1], b[2], b[3])
                         # 코와 눈의 좌표로 조정된 박스의 가로와 세로
 
-                        adjust_width = adjusted_box[2] - adjusted_box[0] 
-                        adjust_height = adjusted_box[3] - adjusted_box[1]
+        #                 adjust_width = adjusted_box[2] - adjusted_box[0] 
+        #                 adjust_height = adjusted_box[3] - adjusted_box[1]
                         
 
                             
@@ -481,23 +264,9 @@ if __name__ == '__main__':
                         
                         cx = adjusted_box[0]
                         cy = adjusted_box[1] + 12
-                        #print(f"cx: {cx}, cy: {cy}")
-
-
-                        # cv2.putText(frame, text, (cx, cy), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255))
-
-                        # # landms
-                        # cv2.circle(frame, (b[5], b[6]), 1, (0, 0, 255), 4)
-                        # cv2.circle(frame, (b[7], b[8]), 1, (0, 255, 255), 4)
-                        # cv2.circle(frame, (b[9], b[10]), 1, (255, 0, 255), 4)
-                        # cv2.circle(frame, (b[11], b[12]), 1, (0, 255, 0), 4)
-                        # cv2.circle(frame, (b[13], b[14]), 1, (255, 0, 0), 4)
-
-
-                        # 저장된 바운딩 박스에 현재 프레임의 정보 추가
-                        # all_boxes.append(adjusted_box)
-                        eye_middle = (eye_x1 + eye_x2) /2
-                        all_lm.append((eye_middle, nose_y))
+                  
+                        # eye_middle = (eye_x1 + eye_x2) /2
+                        # all_lm.append((eye_middle, nose_y))
 
 
                         # 현재프레임 박스 : 이전 프레임에서 집힌 박스랑 가장 가까운 박스 선택
@@ -537,8 +306,8 @@ if __name__ == '__main__':
                             if max_confidence_idx == dis_max_confidence_idx: 
                             
                                 # 만들어진 박스의 중심이 코일 수 있도록 조정 하기
-                                adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
-
+                                #adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
+                                adjusted_box = (b[0], b[1], b[2], b[3])
 
                                 # 크로핑 에러 방지
                                 adjusted_box = (
@@ -571,8 +340,8 @@ if __name__ == '__main__':
                                 b[0], b[1], b[2], b[3] = dets[:,:4][min_distance_idx]
 
                                 # 만들어진 박스의 중심이 코일 수 있도록 조정 하기
-                                adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
-
+                                #adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
+                                adjusted_box = (b[0], b[1], b[2], b[3])
 
                                 # 크로핑 에러 방지
                                 adjusted_box = (
@@ -605,8 +374,8 @@ if __name__ == '__main__':
                             b[0], b[1], b[2], b[3] = dets[:,:4][max_confidence_idx]
 
                             # 만들어진 박스의 중심이 코일 수 있도록 조정 하기
-                            adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
-
+                            #adjusted_box = adjust_box_around_nose((b[0], b[1], b[2], b[3]), (eye_x1,eye_y1,eye_x2,eye_y2), (nose_x, nose_y), (mouth_x1,mouth_y1,mouth_x2,mouth_y2) )
+                            adjusted_box = (b[0], b[1], b[2], b[3])
                             # 코와 눈의 좌표로 조정된 박스의 가로와 세로
 
                             adjust_width = adjusted_box[2] - adjusted_box[0] 
@@ -647,6 +416,11 @@ if __name__ == '__main__':
                         # 이미지를 크롭할 부분 추출
                         cropped_face = frame[adjusted_box[1]:adjusted_box[3], adjusted_box[0]:adjusted_box[2]]
 
+                        # 이미지 크기 확인
+                        if cropped_face.size == 0:
+                            print(f"프레임 {i}에서 얼굴 크롭에 실패하여 스킵합니다.")
+                            continue
+
 
                         cropped_padding = np.zeros_like(cropped_face, dtype=np.uint8)
                         cropped_padding[:cropped_face.shape[0], :cropped_face.shape[1], : ] = cropped_face
@@ -660,21 +434,22 @@ if __name__ == '__main__':
                         ID_video_name = os.path.splitext(os.path.basename(ID_video))[0]
 
                         # 폴더가 없으면 생성
-                        save_folder = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\Cropped_affwild2\\{ID_video_name}\\'
+                        save_folder = f'0214_cropped_affwild2\\{ID_video_name}\\'
                         os.makedirs(save_folder, exist_ok=True)
 
                         # 이미 처리된 동영상인지 확인후 스킵
-                        csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
+                        csv_save_path = f'0214_cropped_affwild2_csv\\{ID_video_name}.csv'
 
                         if os.path.exists(csv_save_path) and os.path.exists(save_folder):
                             print(f"동영상 '{ID_video_name}'은 이미 처리되었습니다. 스킵합니다.")
-                            continue
+                            break
 
                         cv2.imwrite(f'{save_folder}{i}.jpg', cv2.resize(cropped_padding, (224, 224)))
 
                         # DataFrame에 정보 추가
                         # df = df.append({"PATH": ID_video, "BOX": adjusted_box}, ignore_index=True)
                         df = pd.concat([df, pd.DataFrame({"PATH": [ID_video], "FrameNum": [i], "BOX": [adjusted_box]})], ignore_index=True)
+
                     else :
                         print("얼굴이 검출되지 않았습니다.")
                         continue  # 얼굴이 검출되지 않았을 때 다음 프레임으로 넘어가기
@@ -693,9 +468,242 @@ if __name__ == '__main__':
 
             print(f" #################################{ID_video_name} done")
             # CSV 파일로 저장
-            csv_save_path = f'C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\Pytorch_Retinaface\\CSV_cropped_affwild2\\{ID_video_name}.csv'
+            csv_save_path = f'0214_cropped_affwild2_csv\\{ID_video_name}.csv'
             df.to_csv(csv_save_path, index=False)
 
             
                     
         cap.release()
+
+
+
+
+
+if __name__ == '__main__':
+
+
+    torch.set_grad_enabled(False)
+    cfg = None
+    if args.network == "mobile0.25":
+        cfg = cfg_mnet
+    elif args.network == "resnet50":
+        cfg = cfg_re50
+    # net and model
+    net = RetinaFace(cfg=cfg, phase = 'test')
+    net = load_model(net, args.trained_model, args.cpu)
+    net.eval()
+    print('Finished loading model!')
+    print(net)
+    cudnn.benchmark = True
+    device = torch.device("cpu" if args.cpu else "cuda")
+    net = net.to(device)
+
+    resize = 1
+
+
+    data_path = "C:\\Users\\kiosk_passclear\\Desktop\\DeepFace\\aff_wild2\\"
+    img_db_path = "0214_cropped_affwild2"
+    csv_db_path = "0214_cropped_affwild2_csv"
+
+    # testing begin
+    main(img_db_path, csv_db_path)
+
+
+
+    
+
+    """
+    #####################################
+    # def adjust_box_around_nose(box, eye, nose, mouth):
+    
+    #     width = box[2] - box[0] # 박스의 가로
+    #     height = box[3] - box[1] # 박스 세로
+
+       
+    #     # 새로운 박스의 중심점 => (코와 눈의 위치로 조절)
+    #     center_eye_x = ( eye[0] + eye[2] )/2
+    #     center_nose_x = nose[0]
+    #     center_mouth_x = ( mouth[0] + mouth[2] )/2
+    #     # y좌표는 고정
+    #     center_nose_y = nose[1]
+    #     center_eye_y = ( eye[1] + eye[3] )/2
+    #     center_mouth_y = ( mouth[1] + mouth[3] )/2
+
+
+
+    #     # 왼쪽을 바라볼때 ################################################################################################
+    #     if (center_eye_x > center_nose_x) and (center_mouth_x > center_nose_x):
+
+    #         ########################################## 정면인데 이상하게 나오는거 추가 ####################################################3
+    #         if (( mouth[0] + mouth[2] )/3 <  center_nose_x) and (mouth[0]-eye[0] >= 10 ) :
+                    
+    #             # 정면을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
+    #             if abs(center_eye_y - center_nose_y)  <=  abs(center_mouth_y - center_nose_y)*0.35  :
+    #                 # 새로운 박스의 x1, y1
+    #                 new_x1 = int(center_eye_x - ( width / 2))
+    #                 new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2))
+
+
+    #             # 정면을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #####################################
+    #             elif abs(center_eye_y - center_nose_y)*0.5  >= abs(center_mouth_y - center_nose_y) :
+
+    #                 # 새로운 박스의 x1, y1
+    #                 new_x1 = int(center_eye_x - ( width / 2))
+    #                 #new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))
+    #                 #new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2)) # 박스를 위로 올리기
+    #                 new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 위로 올리기
+
+                    
+                
+
+    #             # 완전 정면 ###############################################################################################
+    #             else :
+    #                 # 새로운 박스의 x1, y1
+    #                 new_x1 = int(center_eye_x - ( width / 2))
+    #                 new_y1 = int(center_nose_y - (height / 2))
+
+
+    #         # 왼쪽을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
+    #         elif abs(center_mouth_y - center_nose_y)*0.29 <= abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.45 :
+
+    #             new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2))    ##### y 좌표가 아래로 내려가야 함
+
+    #             # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
+                    
+    #             else :
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
+
+
+    #         # 왼쪽을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #########################################
+    #         elif abs(center_eye_y - center_nose_y)*0.5 >= abs(center_mouth_y - center_nose_y) : 
+
+    #             new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))     ##### y 좌표가 위로 올라가야 함
+
+    #             # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
+                    
+
+    #             else :
+
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
+
+            
+      
+    #         else : # 왼쪽을 바라보는데 정면 ##################################################################################
+                
+    #             new_y1 = int(center_nose_y - (height / 2))
+
+    #              # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 new_x1 = int(center_eye_x + (center_eye_x - center_nose_x)/1.1 - ( width / 2))
+                    
+    #             else :
+
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 new_x1 = int(center_eye_x + (center_mouth_x - center_nose_x)/1.1 - ( width / 2))
+
+
+    #     # 오른쪽을 바라볼때 ###################################################################################################
+    #     elif (center_eye_x < center_nose_x) and (center_mouth_x < center_nose_x) :
+
+    #         # 오른쪽을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ############################################
+    #         # if abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.47  :
+    #         # if abs(center_eye_y - center_nose_y) >= abs(center_mouth_y - center_nose_y) * 0.45:
+    #         if abs(center_mouth_y - center_nose_y)*0.29 <= abs(center_eye_y - center_nose_y) <= abs(center_mouth_y - center_nose_y)*0.45 :
+
+    #             new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2))   ##### y 좌표가 아래로 내려가야 함
+
+    #             # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
+
+    #             else :
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
+
+
+    #         # 오른쪽을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 ############################################
+    #         elif abs(center_eye_y - center_nose_y)* 0.75 >= abs(center_mouth_y - center_nose_y) :
+    #         #elif abs(center_eye_y - center_nose_y) >= abs(center_mouth_y - center_nose_y) * 0.45:
+
+    #             new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2))    ##### y 좌표가 위로 올라가야 함
+
+    #             # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 # new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
+    #                 new_x1 = int(center_eye_x - (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
+                    
+    #             else :
+
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 # new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
+    #                 new_x1 = int(center_eye_x - (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
+
+
+    #         else : # 오른쪽을 바라보는데 정면 #############################################################################
+
+    #             new_y1 = int(center_nose_y - (height / 2))
+
+    #             # 눈 사이의 중앙값이 입 사이의 중앙값보다 클때 => 눈 사이의 중앙값을 이용
+    #             if center_eye_x > center_mouth_x :
+
+    #                 #new_x1 = int(center_eye_x + (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
+    #                 new_x1 = int(center_eye_x - (- center_eye_x + center_nose_x)/1.1 - ( width / 2))
+                    
+
+    #             else :
+    #                 # 눈 사이의 중앙값이 입 사이의 중앙값보다 작을때 => 입 사이의 중앙값을 이용
+    #                 #new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
+    #                 new_x1 = int(center_eye_x + (- center_mouth_x + center_nose_x)/1.1 - ( width / 2))
+
+
+    #     # 정면을 바라볼때 #############################################################################################
+    #     else:
+
+    #         # 정면을 바라보는데 위를 바라볼때 => 코가 눈이랑 가까움 => 입사이의 중앙값을 이용 ######################################
+    #         if abs(center_eye_y - center_nose_y)  <=  abs(center_mouth_y - center_nose_y)*0.35  :
+    #             # 새로운 박스의 x1, y1
+    #             new_x1 = int(center_eye_x - ( width / 2))
+    #             new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 내리기
+
+
+    #         # 정면을 바라보는데 아래를 바라볼때 => 코가 입이랑 가까움 => 눈사이의 중앙값을 이용 #####################################
+    #         elif abs(center_eye_y - center_nose_y)*0.5  >= abs(center_mouth_y - center_nose_y) :
+
+    #             # 새로운 박스의 x1, y1
+    #             new_x1 = int(center_eye_x - ( width / 2))
+    #             #new_y1 = int(center_nose_y - (- center_nose_y + center_eye_y)/2 - ( height / 2))
+    #             #new_y1 = int(center_nose_y + (- center_nose_y + center_mouth_y)/2 - ( height / 2)) # 박스를 위로 올리기
+    #             new_y1 = int(center_nose_y + (- center_nose_y + center_eye_y)/2 - ( height / 2)) # 박스를 위로 올리기
+
+                
+               
+
+    #         # 완전 정면 ###############################################################################################
+    #         else :
+    #             # 새로운 박스의 x1, y1
+    #             new_x1 = int(center_eye_x - ( width / 2))
+    #             new_y1 = int(center_nose_y - (height / 2))
+
+
+
+    #     # 새로운 박스의 x2, y2
+    #     new_x2 = new_x1 + width
+    #     new_y2 = new_y1 + height
+
+    #     return new_x1, new_y1, new_x2, new_y2 # 코의 위치로 조절한 새로운 박스
+    """
+    #######################################
+
+# 왼쪽 위를 쳐다보고 있는 47번 프레임에서 바운딩 박스의 좌표는 (713, 121, 1139, 653) 눈의 좌표는 (811, 292, 1003, 313), 코의 좌표는 (872, 357) 입의 좌표는 (798, 490, 947, 509) 라고 할때 프레임의 바운딩 박스가 정상적
+# 근데 똑같이 왼쪽 위를 쳐다보고 있는 48번 프레임에서 바운딩 박스의 좌표는 (714, 105, 1148, 640) 눈의 좌표는 (823, 279, 1013, 305), 코의 좌표는 (884, 355) 입의 좌표는 (805, 479, 953, 502)인데 이때는 턱이 잘려서 바운딩 박스가 비정상적 이야
